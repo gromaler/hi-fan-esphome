@@ -1,4 +1,4 @@
-# hi-fan-esphome
+#![HI-FAN ESPHome + Home Assistant overview](Hi-Fan%20BLE%20Home%20Assistant%20Integration.png)\n\n hi-fan-esphome
 
 Reverse-engineered ESPHome integration for a Chinese BLE ceiling fan/light with Home Assistant.
 

@@ -1,0 +1,406 @@
+esphome:
+  name: hi-fan-gateway
+  friendly_name: HI-FAN Gateway
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# IMPORTANT:
+# Replace AA:BB:CC:DD:EE:FF with your fan/light BLE MAC.
+# Authentication is 00 FB 03 + the last 3 bytes of that MAC.
+# Example MAC AA:BB:CC:DD:EE:FF -> AUTH 00 FB 03 DD EE FF.
+
+globals:
+  - id: hi_fan_light_on
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: hi_fan_light_state_known
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: hi_fan_brightness
+    type: int
+    restore_value: no
+    initial_value: "100"
+  - id: hi_fan_color_temp
+    type: int
+    restore_value: no
+    initial_value: "50"
+  - id: hi_fan_restore_pending
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: hi_fan_sync_from_device
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: hi_fan_authenticated
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: hi_fan_fan_speed
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: hi_fan_fan_state_known
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: hi_fan_fan_sync_from_device
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+esp32_ble_tracker:
+  scan_parameters:
+    active: true
+
+ble_client:
+  - mac_address: AA:BB:CC:DD:EE:FF
+    id: hi_fan
+    auto_connect: true
+    on_connect:
+      then:
+        - logger.log:
+            level: INFO
+            format: "=== HI-FAN CONNECTED ==="
+        - lambda: |-
+            id(hi_fan_authenticated) = false;
+        - delay: 500ms
+        - logger.log:
+            level: INFO
+            format: ">>> HI-FAN AUTO AUTH: 00-FB-03-DD-EE-FF"
+        - ble_client.ble_write:
+            id: hi_fan
+            service_uuid: "5746"
+            characteristic_uuid: "5701"
+            value: [0x00, 0xFB, 0x03, 0xDD, 0xEE, 0xFF]
+    on_disconnect:
+      then:
+        - logger.log:
+            level: WARN
+            format: "=== HI-FAN DISCONNECTED ==="
+        - lambda: |-
+            if (id(hi_fan_authenticated)) {
+              id(hi_fan_restore_pending) = true;
+              ESP_LOGW("hi_fan", "Power Restore Guard armed: force LIGHT OFF after next AUTH");
+            }
+            id(hi_fan_authenticated) = false;
+
+output:
+  - platform: template
+    id: hi_fan_light_output
+    type: float
+    write_action:
+      - if:
+          condition:
+            lambda: return id(hi_fan_sync_from_device);
+          then:
+            - logger.log:
+                level: DEBUG
+                format: "HA light state sync from device - BLE write suppressed"
+          else:
+            - if:
+                condition:
+                  lambda: return state <= 0.0f;
+                then:
+                  - ble_client.ble_write:
+                      id: hi_fan
+                      service_uuid: "5746"
+                      characteristic_uuid: "5701"
+                      value: [0x0F, 0x03, 0x01, 0x00]
+                else:
+                  - ble_client.ble_write:
+                      id: hi_fan
+                      service_uuid: "5746"
+                      characteristic_uuid: "5701"
+                      value: [0x0F, 0x03, 0x01, 0x01]
+                  - ble_client.ble_write:
+                      id: hi_fan
+                      service_uuid: "5746"
+                      characteristic_uuid: "5701"
+                      value: !lambda |-
+                        int level = (int) roundf(state * 100.0f);
+                        if (level < 1) level = 1;
+                        if (level > 100) level = 100;
+                        return {0x00, 0x0E, 0x01, (uint8_t) level};
+
+  - platform: template
+    id: hi_fan_color_temp_output
+    type: float
+    write_action:
+      - if:
+          condition:
+            lambda: return id(hi_fan_sync_from_device);
+          then:
+            - logger.log:
+                level: DEBUG
+                format: "HA color temperature sync from device - BLE write suppressed"
+          else:
+            - ble_client.ble_write:
+                id: hi_fan
+                service_uuid: "5746"
+                characteristic_uuid: "5701"
+                value: !lambda |-
+                  const float cold_mired = 1000000.0f / 5500.0f;
+                  const float warm_mired = 1000000.0f / 3000.0f;
+                  float s = state;
+                  if (s < 0.0f) s = 0.0f;
+                  if (s > 1.0f) s = 1.0f;
+                  float mired = cold_mired + s * (warm_mired - cold_mired);
+                  float kelvin = 1000000.0f / mired;
+                  int raw = (int) roundf((kelvin - 3000.0f) / 25.0f);
+                  if (raw < 0) raw = 0;
+                  if (raw > 100) raw = 100;
+                  return {0x00, 0x0F, 0x01, (uint8_t) raw};
+
+light:
+  - platform: color_temperature
+    name: "HI-FAN Light"
+    id: hi_fan_light
+    brightness: hi_fan_light_output
+    color_temperature: hi_fan_color_temp_output
+    warm_white_color_temperature: 3000 K
+    cold_white_color_temperature: 5500 K
+    default_transition_length: 0s
+
+fan:
+  - platform: template
+    name: "HI-FAN Fan"
+    id: hi_fan_fan
+    speed_count: 6
+    has_direction: false
+    has_oscillating: false
+    restore_mode: NO_RESTORE
+
+    on_turn_on:
+      then:
+        - if:
+            condition:
+              lambda: return id(hi_fan_fan_sync_from_device);
+            then:
+              - logger.log:
+                  level: DEBUG
+                  format: "Fan ON sync from device - BLE write suppressed"
+            else:
+              - ble_client.ble_write:
+                  id: hi_fan
+                  service_uuid: "5746"
+                  characteristic_uuid: "5701"
+                  value: !lambda |-
+                    int speed = id(hi_fan_fan).speed;
+                    if (speed < 1) speed = 1;
+                    if (speed > 6) speed = 6;
+                    return {0x00, 0x02, 0x01, (uint8_t)(speed * 10)};
+
+    on_turn_off:
+      then:
+        - if:
+            condition:
+              lambda: return id(hi_fan_fan_sync_from_device);
+            then:
+              - logger.log:
+                  level: DEBUG
+                  format: "Fan OFF sync from device - BLE write suppressed"
+            else:
+              - ble_client.ble_write:
+                  id: hi_fan
+                  service_uuid: "5746"
+                  characteristic_uuid: "5701"
+                  value: [0x00, 0x02, 0x01, 0x00]
+
+    on_speed_set:
+      then:
+        - if:
+            condition:
+              lambda: return id(hi_fan_fan_sync_from_device);
+            then:
+              - logger.log:
+                  level: DEBUG
+                  format: "Fan speed sync from device - BLE write suppressed"
+            else:
+              - ble_client.ble_write:
+                  id: hi_fan
+                  service_uuid: "5746"
+                  characteristic_uuid: "5701"
+                  value: !lambda |-
+                    int speed = x;
+                    if (speed < 1) speed = 1;
+                    if (speed > 6) speed = 6;
+                    return {0x00, 0x02, 0x01, (uint8_t)(speed * 10)};
+
+script:
+  - id: restore_light_off
+    mode: restart
+    then:
+      - delay: 300ms
+      - logger.log:
+          level: WARN
+          format: ">>> POWER RESTORE GUARD: LIGHT OFF"
+      - ble_client.ble_write:
+          id: hi_fan
+          service_uuid: "5746"
+          characteristic_uuid: "5701"
+          value: [0x0F, 0x03, 0x01, 0x00]
+
+  - id: sync_light_from_device
+    mode: restart
+    parameters:
+      state: bool
+      brightness: int
+    then:
+      - lambda: |-
+          id(hi_fan_sync_from_device) = true;
+          auto call = id(hi_fan_light).make_call();
+          call.set_state(state);
+          if (brightness > 0) call.set_brightness(brightness / 100.0f);
+          call.perform();
+      - delay: 50ms
+      - lambda: id(hi_fan_sync_from_device) = false;
+
+  - id: sync_color_temp_from_device
+    mode: restart
+    parameters:
+      raw: int
+    then:
+      - lambda: |-
+          int value = raw;
+          if (value < 0) value = 0;
+          if (value > 100) value = 100;
+          float kelvin = 3000.0f + (value * 25.0f);
+          float mired = 1000000.0f / kelvin;
+          id(hi_fan_sync_from_device) = true;
+          auto call = id(hi_fan_light).make_call();
+          call.set_color_temperature(mired);
+          call.perform();
+      - delay: 50ms
+      - lambda: id(hi_fan_sync_from_device) = false;
+
+text_sensor:
+  - platform: ble_client
+    ble_client_id: hi_fan
+    id: hi_fan_notify
+    name: "HI-FAN BLE Raw"
+    internal: true
+    service_uuid: "5746"
+    characteristic_uuid: "5703"
+    notify: true
+    update_interval: never
+    on_notify:
+      then:
+        - lambda: |-
+            std::string hex;
+            char buf[4];
+            for (size_t i = 0; i < x.size(); i++) {
+              snprintf(buf, sizeof(buf), "%02X", (uint8_t)x[i]);
+              if (i > 0) hex += "-";
+              hex += buf;
+            }
+            ESP_LOGI("hi_fan", "<<< RX 5703: %s (%u bytes)", hex.c_str(), (unsigned)x.size());
+
+            // AUTH success. Replace DD EE FF below with the last 3 bytes of your BLE MAC.
+            if (x.size() == 6 &&
+                (uint8_t)x[0] == 0x00 &&
+                (uint8_t)x[1] == 0xFB &&
+                (uint8_t)x[2] == 0x03 &&
+                (uint8_t)x[3] == 0xDD &&
+                (uint8_t)x[4] == 0xEE &&
+                (uint8_t)x[5] == 0xFF) {
+              id(hi_fan_authenticated) = true;
+              ESP_LOGI("hi_fan", "=== HI-FAN AUTHENTICATED ===");
+              if (id(hi_fan_restore_pending)) {
+                ESP_LOGW("hi_fan", "Power Restore Guard: forcing LIGHT OFF after reconnect");
+                id(hi_fan_restore_pending) = false;
+                id(restore_light_off).execute();
+              }
+              return;
+            }
+
+            if (x.size() == 4 && (uint8_t)x[0] == 0x0F &&
+                (uint8_t)x[1] == 0x03 && (uint8_t)x[2] == 0x01) {
+              bool new_state = ((uint8_t)x[3] == 0x01);
+              id(hi_fan_light_on) = new_state;
+              id(hi_fan_light_state_known) = true;
+              id(sync_light_from_device).execute(new_state, id(hi_fan_brightness));
+              return;
+            }
+
+            if (x.size() == 4 && (uint8_t)x[0] == 0x00 &&
+                (uint8_t)x[1] == 0x0E && (uint8_t)x[2] == 0x01) {
+              int level = (uint8_t)x[3];
+              if (level > 100) level = 100;
+              id(hi_fan_brightness) = level;
+              if (id(hi_fan_light_state_known))
+                id(sync_light_from_device).execute(id(hi_fan_light_on), level);
+              return;
+            }
+
+            if (x.size() == 4 && (uint8_t)x[0] == 0x00 &&
+                (uint8_t)x[1] == 0x0F && (uint8_t)x[2] == 0x01) {
+              int raw = (uint8_t)x[3];
+              if (raw > 100) raw = 100;
+              id(hi_fan_color_temp) = raw;
+              id(sync_color_temp_from_device).execute(raw);
+              return;
+            }
+
+            if (x.size() == 5 && (uint8_t)x[0] == 0x00 &&
+                (uint8_t)x[1] == 0x13 && (uint8_t)x[2] == 0x02 &&
+                (uint8_t)x[3] == 0x05 && (uint8_t)x[4] == 0x05) {
+              id(hi_fan_light_on) = true;
+              id(hi_fan_light_state_known) = true;
+              id(hi_fan_brightness) = 5;
+              id(sync_light_from_device).execute(true, 5);
+              return;
+            }
+
+            if (x.size() == 4 && (uint8_t)x[0] == 0x00 &&
+                (uint8_t)x[1] == 0x02 && (uint8_t)x[2] == 0x01) {
+              int raw = (uint8_t)x[3];
+              int speed = 0;
+              if (raw > 0) {
+                speed = (int) roundf(raw / 10.0f);
+                if (speed < 1) speed = 1;
+                if (speed > 6) speed = 6;
+              }
+              id(hi_fan_fan_speed) = speed;
+              id(hi_fan_fan_state_known) = true;
+              id(hi_fan_fan_sync_from_device) = true;
+              if (speed == 0) {
+                id(hi_fan_fan).state = false;
+              } else {
+                id(hi_fan_fan).state = true;
+                id(hi_fan_fan).speed = speed;
+              }
+              id(hi_fan_fan).publish_state();
+              id(hi_fan_fan_sync_from_device) = false;
+              return;
+            }
+
+button:
+  - platform: template
+    name: "HI-FAN Night Light"
+    id: hi_fan_night_light
+    icon: "mdi:weather-night"
+    on_press:
+      then:
+        - ble_client.ble_write:
+            id: hi_fan
+            service_uuid: "5746"
+            characteristic_uuid: "5701"
+            value: [0x00, 0x13, 0x02, 0x05, 0x05]

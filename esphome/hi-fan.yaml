@@ -19,6 +19,22 @@ logger:
   level: DEBUG
 
 api:
+  actions:
+    # Send an arbitrary hex packet to characteristic 5701 (debugging / reverse engineering).
+    - action: hi_fan_send_hex
+      variables:
+        hex: string
+      then:
+        - ble_client.ble_write:
+            id: hi_fan
+            service_uuid: "5746"
+            characteristic_uuid: "5701"
+            value: !lambda |-
+              std::vector<uint8_t> out;
+              for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                out.push_back((uint8_t) strtol(hex.substr(i, 2).c_str(), nullptr, 16));
+              }
+              return out;
 
 ota:
   - platform: esphome
@@ -136,7 +152,7 @@ ble_client:
             id: hi_fan
             service_uuid: "5746"
             characteristic_uuid: "5701"
-            value: [0x00, 0xFB, 0x03, ${auth_b1}, ${auth_b2}, ${auth_b3}]
+            value: !lambda "return {0x00, 0xFB, 0x03, ${auth_b1}, ${auth_b2}, ${auth_b3}};"
 
 
     on_disconnect:
@@ -394,10 +410,49 @@ fan:
     id: hi_fan_fan
 
     speed_count: 6
-    has_direction: false
-    has_oscillating: false
+    has_direction: true
+    has_oscillating: true
 
     restore_mode: NO_RESTORE
+
+    # Oscillation (air guide): 0F 05 01 01 = on, 0F 05 01 00 = off
+    on_oscillating_set:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                return id(hi_fan_fan_sync_from_device);
+            then:
+              - logger.log:
+                  level: DEBUG
+                  format: "Fan oscillating sync from device - BLE write suppressed"
+            else:
+              - ble_client.ble_write:
+                  id: hi_fan
+                  service_uuid: "5746"
+                  characteristic_uuid: "5701"
+                  value: !lambda |-
+                    return {0x0F, 0x05, 0x01, (uint8_t) (x ? 0x01 : 0x00)};
+
+    # Direction: 0F 04 01 01 = downdraft (HA forward), 0F 04 01 02 = updraft (HA reverse)
+    on_direction_set:
+      then:
+        - if:
+            condition:
+              lambda: |-
+                return id(hi_fan_fan_sync_from_device);
+            then:
+              - logger.log:
+                  level: DEBUG
+                  format: "Fan direction sync from device - BLE write suppressed"
+            else:
+              - ble_client.ble_write:
+                  id: hi_fan
+                  service_uuid: "5746"
+                  characteristic_uuid: "5701"
+                  value: !lambda |-
+                    return {0x0F, 0x04, 0x01,
+                            (uint8_t) (x == esphome::fan::FanDirection::REVERSE ? 0x02 : 0x01)};
 
 
     # --------------------------------------------------------
@@ -705,6 +760,59 @@ script:
           id(hi_fan_sync_from_device) = false;
 
 
+  # ----------------------------------------------------------
+  # FAN DEVICE -> HA (speed / oscillation / direction)
+  # ----------------------------------------------------------
+
+  - id: sync_fan_from_device
+    mode: restart
+    parameters:
+      speed: int
+    then:
+      - lambda: |-
+          id(hi_fan_fan_sync_from_device) = true;
+          auto call = id(hi_fan_fan).make_call();
+          if (speed <= 0) {
+            call.set_state(false);
+          } else {
+            call.set_state(true);
+            call.set_speed(speed);
+          }
+          call.perform();
+      - delay: 50ms
+      - lambda: |-
+          id(hi_fan_fan_sync_from_device) = false;
+
+  - id: sync_fan_osc_from_device
+    mode: restart
+    parameters:
+      is_on: bool
+    then:
+      - lambda: |-
+          id(hi_fan_fan_sync_from_device) = true;
+          auto call = id(hi_fan_fan).make_call();
+          call.set_oscillating(is_on);
+          call.perform();
+      - delay: 50ms
+      - lambda: |-
+          id(hi_fan_fan_sync_from_device) = false;
+
+  - id: sync_fan_dir_from_device
+    mode: restart
+    parameters:
+      reverse: bool
+    then:
+      - lambda: |-
+          id(hi_fan_fan_sync_from_device) = true;
+          auto call = id(hi_fan_fan).make_call();
+          call.set_direction(reverse ? esphome::fan::FanDirection::REVERSE
+                                     : esphome::fan::FanDirection::FORWARD);
+          call.perform();
+      - delay: 50ms
+      - lambda: |-
+          id(hi_fan_fan_sync_from_device) = false;
+
+
 # ============================================================
 # HI-FAN 5703 NOTIFICATIONS
 # ============================================================
@@ -1006,3 +1114,43 @@ text_sensor:
 
               id(hi_fan_fan_speed) =
                 speed;
+
+              id(hi_fan_fan_state_known) =
+                true;
+
+              id(sync_fan_from_device).execute(speed);
+
+              return;
+            }
+
+
+            // ================================================
+            // FAN OSCILLATION  0F 05 01 00/01
+            // ================================================
+
+            if (
+              x.size() == 4 &&
+              (uint8_t)x[0] == 0x0F &&
+              (uint8_t)x[1] == 0x05 &&
+              (uint8_t)x[2] == 0x01
+            ) {
+              id(sync_fan_osc_from_device).execute((uint8_t)x[3] != 0);
+              return;
+            }
+
+
+            // ================================================
+            // FAN DIRECTION  0F 04 01 01 (down) / 02 (up)
+            // The remote's F/R key reports 0F 04 01 03 (meaning unknown), ignored.
+            // ================================================
+
+            if (
+              x.size() == 4 &&
+              (uint8_t)x[0] == 0x0F &&
+              (uint8_t)x[1] == 0x04 &&
+              (uint8_t)x[2] == 0x01 &&
+              ((uint8_t)x[3] == 0x01 || (uint8_t)x[3] == 0x02)
+            ) {
+              id(sync_fan_dir_from_device).execute((uint8_t)x[3] == 0x02);
+              return;
+            }
